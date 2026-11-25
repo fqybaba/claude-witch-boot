@@ -1,0 +1,9 @@
+# 中间产物和模型（见 README）
+pipeline/tools_dl/
+pipeline/hd/
+pipeline/intro/frames_*/
+pipeline/intro/_probe/
+build/
+player/build/
+*.wav
+__pycache__/

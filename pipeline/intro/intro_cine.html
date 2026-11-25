@@ -1,0 +1,248 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<style>html,body{margin:0;background:#040206;overflow:hidden}canvas{display:block}</style>
+</head><body>
+<canvas id="c"></canvas>
+<script>
+// 电影感版开屏 + 循环背景。画面主体是三段 AI 视频（build_cine_base.py 排好的底片帧，经 setChar 逐帧送进来），
+// 这个页面只做：淡入、调色暗角、Claude 字标、闪光转场、字幕、标题、接循环背景。render(t, mode)；mode = "intro" | "loop"
+// 渲染：node render.mjs intro 输出目录 --page intro_cine.html --char _probe/cine_base --char-start 0 --char-fps 30
+// 时间线（INTRO_LEN 13.5，和 build_cine_base.py、sfx_cine.py 对齐）：
+//   0.00–3.60  抽书：缠锁链的书从铁书架里滑出来，浮到半空
+//   3.60–7.94  断链（约 4.7 崩断）→ 书翻开（约 5.8）→ 橘色法阵升起（约 6.6）
+//   7.0–8.4    法阵中央出现 Claude 字标和 “Quality, above all.”；7.94 起画面定格、轻微推近
+//   8.40       橘金色闪光，切到魔女
+//   8.4–13.5   魔女现身；台词 9.2–11.5；11.6 起“欢迎回来”；12.72–13.42 渐变成 loop(0)
+const c = document.getElementById("c");
+const SC = +(new URLSearchParams(location.search).get("scale") || (4/3));
+c.width = Math.round(1920*SC); c.height = Math.round(1080*SC);
+const g = c.getContext("2d");
+const W = 1920, H = 1080, CX = W/2, CY = H/2, TAU = Math.PI*2;
+const GOLD = "#F2C27B", ORANGE = "#E8834F";
+const SERIF_CN = '"Noto Serif SC", "Source Han Serif SC", STSong, serif';
+const SERIF_EN = "Georgia, serif";
+const INTRO_LEN = 13.5, LOOP_LEN = 8;
+const T_HOLD = 7.94, T_WITCH = 8.4;
+const SIG = [913, 376], SIG_R = 172;      // S2 最后一帧里法阵的圆心和内圈半径（屏幕坐标）
+
+const clamp = (x,a=0,b=1)=>Math.max(a,Math.min(b,x));
+const ease = t => 1-Math.pow(1-clamp(t),3);
+const easeIO = t => { t=clamp(t); return t<0.5 ? 4*t*t*t : 1-Math.pow(-2*t+2,3)/2; };
+const seg = (t,a,b)=>clamp((t-a)/(b-a));
+const bump = (t,a,b,c2,d)=>Math.min(seg(t,a,b), 1-seg(t,c2,d));
+const lerp = (a,b,k)=>a+(b-a)*k;
+function rnd(i){ const x = Math.sin(i*127.1+311.7)*43758.5453; return x-Math.floor(x); }
+const rgba = (hex,a)=>{ const n=parseInt(hex.slice(1),16); return `rgba(${n>>16},${(n>>8)&255},${n&255},${a})`; };
+
+const END = new Image(); END.src = "assets/witch_end_hd.jpg";   // 魔女视频最后一帧，也是循环背景
+let charImg = END;
+const cache = new Map();
+window.setChar = url => new Promise(res => {
+  if (!url) { charImg = END; return res(); }
+  if (cache.has(url)) { charImg = cache.get(url); return res(); }
+  const im = new Image(); im.onload = () => { cache.clear(); cache.set(url, im); charImg = im; res(); };
+  im.onerror = () => { charImg = END; res(); }; im.src = url;
+});
+const WORD_FONT = `italic 118px ${SERIF_EN}`;
+window.ready = () => Promise.all([document.fonts.ready, END.decode()]);
+
+function cover(img, scale, ax, ay, filter = "none"){
+  const iw = img.naturalWidth, ih = img.naturalHeight;
+  if (!iw) return;
+  const s = Math.max(W/iw, H/ih)*scale, dw = iw*s, dh = ih*s;
+  let x = W*ax - ax*dw, y = H*ay - ay*dh;
+  x = Math.min(0, Math.max(W-dw, x)); y = Math.min(0, Math.max(H-dh, y));
+  g.save(); g.filter = filter; g.drawImage(img, x, y, dw, dh); g.restore();
+}
+function glow(x, y, r, color, a, op = "lighter"){
+  if (a <= 0) return;
+  g.save(); g.globalCompositeOperation = op;
+  const gr = g.createRadialGradient(x, y, 0, x, y, r);
+  gr.addColorStop(0, rgba(color, a)); gr.addColorStop(0.35, rgba(color, a*0.35)); gr.addColorStop(1, rgba(color, 0));
+  g.fillStyle = gr; g.fillRect(x-r, y-r, r*2, r*2); g.restore();
+}
+function vignette(a, tint = "0,0,0"){
+  const gr = g.createRadialGradient(CX, CY, 380, CX, CY, 1200);
+  gr.addColorStop(0, `rgba(${tint},0)`); gr.addColorStop(1, `rgba(${tint},${a})`);
+  g.fillStyle = gr; g.fillRect(0, 0, W, H);
+}
+function text(s, x, y, font, color, alpha, align = "center", spacing = 0){
+  if (alpha <= 0) return;
+  g.save(); g.globalAlpha = alpha; g.font = font; g.fillStyle = color; g.textAlign = align; g.textBaseline = "middle";
+  if (spacing) g.letterSpacing = spacing + "px";
+  g.fillText(s, x, y); g.restore();
+}
+function line(s, t, a, b){
+  const k = bump(t, a, a+0.45, b-0.45, b);
+  if (k <= 0) return;
+  g.save(); g.shadowColor = "rgba(0,0,0,0.95)"; g.shadowBlur = (20)*SC;
+  text(s, CX, H-118 + (1-ease(seg(t, a, a+0.6)))*8, `500 38px ${SERIF_CN}`, "#F6E6CC", k, "center", 3);
+  g.restore();
+}
+function dust(t, alpha, n, period, seed){
+  if (alpha <= 0) return;
+  g.save(); g.globalCompositeOperation = "lighter";
+  for (let i = 0; i < n; i++){
+    const k = i + seed, x0 = rnd(k)*W, y0 = rnd(k+50)*H, size = 0.8 + rnd(k+9)**3*3.2;
+    const vy = Math.max(1, Math.round((14 + rnd(k+3)*40)*period/H))*H/period;
+    const y = ((y0 - vy*t) % H + H) % H;
+    const x = x0 + Math.sin(t*TAU/period + k)*18;
+    const tw = 0.55 + 0.45*Math.sin(t*TAU*Math.round(1+rnd(k+4)*3)/period + k*1.7);
+    const a = alpha*tw*(0.25 + rnd(k+11)*0.75);
+    const gr = g.createRadialGradient(x, y, 0, x, y, size*4);
+    gr.addColorStop(0, rgba(i%4 ? GOLD : ORANGE, a)); gr.addColorStop(1, rgba(ORANGE, 0));
+    g.fillStyle = gr; g.beginPath(); g.arc(x, y, size*4, 0, TAU); g.fill();
+  }
+  g.restore();
+}
+
+// Claude 字标：和法阵同一种“烧出来的余烬线条”，不是贴上去的字。?v=1/2/3 可以换字体对比
+const V = +(new URLSearchParams(location.search).get("v") || 1);
+const WORDS = {
+  1: { txt: "Claude", font: '114px "Old English Text MT"', sp: 1, dy: -10 },    // 哥特黑体，和法阵外圈的符文一个体系
+  2: { txt: "CLAUDE", font: '82px "Felix Titling"', sp: 16, dy: -6 },           // 罗马碑刻大写
+  3: { txt: "Claude", font: "132px Centaur", sp: 3, dy: -8 },                   // 文艺复兴衬线
+};
+const EC = document.createElement("canvas"); EC.width = Math.round(760*SC); EC.height = Math.round(340*SC);
+function emberWord(t, wa, hz){
+  const w = WORDS[V] || WORDS[1], x = EC.getContext("2d"), [sx, sy] = SIG;
+  x.setTransform(SC, 0, 0, SC, 0, 0); x.globalAlpha = 1; x.globalCompositeOperation = "source-over"; x.clearRect(0, 0, 760, 340);
+  x.textAlign = "center"; x.textBaseline = "middle";
+  x.font = w.font; x.letterSpacing = w.sp + "px";
+  const tg = x.createLinearGradient(0, 100, 0, 230);
+  tg.addColorStop(0, "#FFE2B4"); tg.addColorStop(0.5, "#FFAE5E"); tg.addColorStop(1, "#E8682A");
+  x.fillStyle = tg; x.fillText(w.txt, 380, 160 + w.dy);
+  const qa = ease(seg(t, 7.45, 7.95));
+  if (qa > 0){
+    x.globalAlpha = 0.95*qa; x.font = 'italic 37px "Vivaldi"'; x.letterSpacing = "1.5px";
+    x.fillStyle = "#FFC48A"; x.fillText("Qualitas ante omnia", 380, 238); x.globalAlpha = 1;
+  }
+  // 余烬颗粒：把笔画打碎一点，并随时间闪动
+  x.globalCompositeOperation = "destination-out";
+  const fr = Math.floor(t*12);
+  for (let i = 0; i < 1100; i++){
+    const px = rnd(i*3 + fr*0.37 + 1)*760, py = 70 + rnd(i*3 + fr*0.61 + 2)*200, r = 0.5 + rnd(i + 5)*1.5;
+    x.globalAlpha = 0.25 + 0.5*rnd(i + fr + 9); x.beginPath(); x.arc(px, py, r, 0, TAU); x.fill();
+  }
+  // 从左往右“烧”出来：烧到的地方之后的部分还看不见
+  const k = ease(wa);
+  if (k < 1){
+    x.globalAlpha = 1;
+    const gr = x.createLinearGradient(760*k - 60, 0, 760*k + 20, 0);
+    gr.addColorStop(0, "rgba(0,0,0,0)"); gr.addColorStop(1, "rgba(0,0,0,1)");
+    x.fillStyle = gr; x.fillRect(760*k - 60, 0, 900, 340);
+  }
+  x.globalAlpha = 1; x.globalCompositeOperation = "source-over";
+  // 把法阵内圈的五芒星柔和地压暗（边缘渐变，不是一块黑圆）
+  const R = SIG_R*hz*1.08, dk = ease(seg(t, 7.0, 7.5));
+  const dg = g.createRadialGradient(sx, sy, 0, sx, sy, R);
+  dg.addColorStop(0, `rgba(8,4,3,${0.80*dk})`); dg.addColorStop(0.72, `rgba(8,4,3,${0.70*dk})`); dg.addColorStop(1, "rgba(8,4,3,0)");
+  g.fillStyle = dg; g.fillRect(sx - R, sy - R, 2*R, 2*R);
+  // 发光叠加：大辉光 + 近辉光 + 字芯
+  const fl = 0.93 + 0.07*Math.sin(t*31) , burn = 1 + 1.2*(1 - k);
+  g.save(); g.globalCompositeOperation = "lighter"; g.translate(sx - 380, sy - 160);
+  g.filter = `blur(${18*SC}px)`; g.globalAlpha = 0.5*fl*burn; g.drawImage(EC, 0, 0, 760, 340);
+  g.filter = `blur(${5*SC}px)`; g.globalAlpha = 0.6*fl; g.drawImage(EC, 0, 0, 760, 340);
+  g.filter = `blur(${0.9*SC}px)`; g.globalAlpha = 0.9*fl; g.drawImage(EC, 0, 0, 760, 340);
+  g.restore();
+}
+
+// 魔女画面（开屏后半段和循环背景共用同一套画法）
+// 魔女构图：现身时居中；10.2–12.6 镜头慢慢放大、把她推到画面中间偏右（循环背景就停在这个构图，脸大约在横向 62% 处）
+const LOOP_FRAME = { s: 1.25, ax: 0.0, ay: 0.15 };
+const witchCam = t => { const k = easeIO(seg(t, 10.2, 12.6)); return { s: lerp(1.0, LOOP_FRAME.s, k), ax: lerp(0.5, LOOP_FRAME.ax, k), ay: lerp(0.22, LOOP_FRAME.ay, k) }; };
+function witchLayer(img, cam, bright){
+  cover(img, cam.s, cam.ax, cam.ay, `brightness(${bright.toFixed(3)}) contrast(1.04)`);
+  vignette(0.55, "9,3,16");
+}
+
+function intro(t){
+  g.fillStyle = "#040206"; g.fillRect(0, 0, W, H);
+  if (t < T_WITCH){
+    // 前半段：AI 视频底片。定格时以法阵为中心轻微推近
+    const hz = 1 + 0.035*ease(seg(t, T_HOLD, T_WITCH));
+    cover(charImg, hz, SIG[0]/W, SIG[1]/H, "contrast(1.05) brightness(0.96)");
+    vignette(0.45, "6,2,10");
+    // Claude 字标：压暗法阵内圈，字从余烬里亮起来
+    const wa = seg(t, 7.0, 7.6);
+    if (wa > 0) emberWord(t, wa, hz);
+  } else {
+    witchLayer(charImg, witchCam(t), 0.86);
+    const sb = 0.5*ease(seg(t, T_WITCH + 0.5, T_WITCH + 1.0));
+    const gr = g.createLinearGradient(0, H - 300, 0, H);
+    gr.addColorStop(0, "rgba(0,0,0,0)"); gr.addColorStop(1, `rgba(0,0,0,${sb})`);
+    g.fillStyle = gr; g.fillRect(0, H - 300, W, 300);
+    dust(t - INTRO_LEN, 0.6*ease(seg(t, T_WITCH + 1.5, T_WITCH + 3.5)), 110, LOOP_LEN, 2000);
+  }
+
+  // 闪光转场：法阵中心炸开橘金色的光，盖住切换
+  const dt = t - T_WITCH;
+  if (dt > -0.2 && dt < 0.8){
+    const pk = dt < 0 ? Math.pow(seg(dt, -0.2, 0), 2.2) : Math.pow(1 - dt/0.8, 2.0);
+    const rad = 260 + ease(seg(dt, -0.2, 0.35))*1700;
+    const ox = lerp(SIG[0], CX, seg(dt, 0, 0.4)), oy = lerp(SIG[1], H*0.4, seg(dt, 0, 0.4));
+    g.save(); g.globalCompositeOperation = "screen";
+    const gr = g.createRadialGradient(ox, oy, 0, ox, oy, rad);
+    gr.addColorStop(0, `rgba(255,244,222,${pk})`); gr.addColorStop(0.18, `rgba(255,198,120,${0.95*pk})`);
+    gr.addColorStop(0.5, `rgba(226,120,52,${0.7*pk})`); gr.addColorStop(1, `rgba(110,40,14,${0.6*pk})`);
+    g.fillStyle = gr; g.fillRect(0, 0, W, H); g.restore();
+    // 飞散的余烬
+    if (dt > 0){
+      g.save(); g.globalCompositeOperation = "lighter"; g.lineCap = "round";
+      for (let i = 0; i < 80; i++){
+        const an = rnd(i+90)*TAU, sp = 500 + rnd(i+91)*1400, d = sp*(1 - Math.exp(-3*dt))/3, v = sp*Math.exp(-3*dt);
+        const x = SIG[0] + Math.cos(an)*d, y = SIG[1] + Math.sin(an)*d + 120*dt*dt, al = (1 - seg(dt, 0.15, 0.8))*(0.4 + 0.6*rnd(i+92));
+        if (al <= 0) continue;
+        const L = 3 + v*0.02;
+        g.strokeStyle = rgba(i % 3 ? ORANGE : GOLD, al); g.lineWidth = 1 + rnd(i+93)*1.8;
+        g.beginPath(); g.moveTo(x, y); g.lineTo(x - Math.cos(an)*L, y - Math.sin(an)*L); g.stroke();
+      }
+      g.restore();
+    }
+  }
+  vignette(0.5);
+
+  line("……谁允许你翻开这本书的？", t, 9.2, 11.5);
+  const wel = ease(seg(t, 11.5, 11.95));
+  if (wel > 0){
+    const gr = g.createLinearGradient(0, 0, 900, 0);
+    gr.addColorStop(0, `rgba(5,3,6,${0.72*wel})`); gr.addColorStop(1, "rgba(5,3,6,0)");
+    g.fillStyle = gr; g.fillRect(0, 0, 900, H);
+    const LAT = new URLSearchParams(location.search).get("l") === "g" ? "italic 34px Garamond" : `italic 40px "Vivaldi"`;
+    const WF = { 1: ["欢迎回来", "96px STXingkai", 104, 0], 2: ["欢迎回来", "92px FZShuTi", 102, 0], 3: ["Welcome back", "italic 92px Garamond", 0, 0], 4: ["Welcome back", "italic 88px Georgia", 0, 0] }[+(new URLSearchParams(location.search).get("w") || 3)];
+    [...(WF[2] ? WF[0] : [WF[0]])].forEach((ch, i) => {
+      const a = ease(seg(t, 11.6 + i*0.09, 12.05 + i*0.09));
+      if (a <= 0) return;
+      g.save(); g.globalAlpha = a; g.font = WF[1]; g.textAlign = "left"; g.textBaseline = "middle";
+      const tg = g.createLinearGradient(0, 460, 0, 545);
+      tg.addColorStop(0, "#F8E2BE"); tg.addColorStop(1, "#D9A06A");
+      g.fillStyle = tg; g.shadowColor = rgba(ORANGE, 0.45); g.shadowBlur = (24)*SC;
+      g.fillText(ch, 130 + i*WF[2], 500 + (1 - a)*10); g.restore();
+    });
+    const la = ease(seg(t, 11.82, 12.2));
+    g.fillStyle = rgba(GOLD, 0.55*wel); g.fillRect(134, 570, 360*la, 1);
+    if (la > 0){ g.save(); g.translate(134 + 360*la + 12, 570.5); g.rotate(Math.PI/4); g.globalAlpha = la; g.strokeStyle = rgba(GOLD, 0.8); g.lineWidth = 1; g.strokeRect(-3.5, -3.5, 7, 7); g.restore(); }
+    text("Ne me morari facias.", 140, 624, LAT, "#EBD6B6", 0.88*ease(seg(t, 11.75, 12.1)), "left", 2);
+  }
+  const fin = 1 - ease(seg(t, 0, 0.8));
+  if (fin > 0){ g.fillStyle = `rgba(3,2,5,${fin})`; g.fillRect(0, 0, W, H); }
+  const toLoop = easeIO(seg(t, 12.72, 13.42));
+  if (toLoop > 0){ g.save(); g.globalAlpha = toLoop; loop(0, true); g.restore(); }
+}
+
+function loop(t, overlay = false){
+  const ph = (t % LOOP_LEN)/LOOP_LEN*TAU, breath = 0.5 - 0.5*Math.cos(ph);
+  if (!overlay){ g.fillStyle = "#040206"; g.fillRect(0, 0, W, H); }
+  witchLayer(END, { s: LOOP_FRAME.s + 0.006*breath, ax: LOOP_FRAME.ax, ay: LOOP_FRAME.ay }, 0.86 + 0.05*breath);
+  glow(W*0.73, H*0.42, 520, ORANGE, 0.05 + 0.06*breath);
+  dust(t, 0.6, 110, LOOP_LEN, 2000);
+  vignette(0.5);
+}
+
+function render(t, mode){
+  g.setTransform(SC, 0, 0, SC, 0, 0); g.globalAlpha = 1; g.globalCompositeOperation = "source-over"; g.filter = "none";
+  if (mode === "loop") loop(t); else intro(t);
+}
+window.render = render;
+window.INTRO_LEN = INTRO_LEN; window.LOOP_LEN = LOOP_LEN; window.CHAR_START = 0;
+</script></body></html>
